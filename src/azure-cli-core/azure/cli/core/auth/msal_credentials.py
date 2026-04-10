@@ -55,6 +55,33 @@ class UserCredential:  # pylint: disable=too-few-public-methods
         result = self._msal_app.acquire_token_silent_with_error(
             scopes, self._account, claims_challenge=claims_challenge, **kwargs)
 
+        # When logged in via `az login` without --tenant, MSAL uses the 'organizations' authority and
+        # caches the refresh token under the 'organizations' realm. However, _create_credential always
+        # builds a PCA with the account's specific tenant authority (from account[_TENANT_ID]), so
+        # acquire_token_silent_with_error cannot find the 'organizations'-realm token and returns None.
+        # This also affects find_using_common_tenant at login time, which creates one PCA per tenant.
+        # Fix: when a specific-tenant PCA returns None, retry with the 'organizations' authority PCA
+        # (sharing the same token cache) so MSAL can locate and redeem the cached refresh token.
+        if result is None and self._msal_app.authority.tenant not in ('organizations', 'common'):
+            logger.debug("UserCredential.acquire_token: specific-tenant silent acquisition returned None; "
+                         "retrying with 'organizations' authority to find cached refresh token")
+            # Rebuild the authority URL, replacing the current tenant segment with 'organizations'.
+            # authorization_endpoint looks like:
+            #   https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize
+            # We need:
+            #   https://login.microsoftonline.com/organizations
+            authority_base = self._msal_app.authority.authorization_endpoint.split('/oauth2')[0]
+            authority_base = authority_base.rsplit('/', 1)[0]  # strip the current tenant segment
+            organizations_authority = authority_base + '/organizations'
+            organizations_msal_app = PublicClientApplication(
+                self._msal_app.client_id,
+                authority=organizations_authority,
+                token_cache=self._msal_app.token_cache)
+            organizations_accounts = organizations_msal_app.get_accounts(self._account.get('username', ''))
+            if organizations_accounts:
+                result = organizations_msal_app.acquire_token_silent_with_error(
+                    scopes, organizations_accounts[0], claims_challenge=claims_challenge, **kwargs)
+
         from azure.cli.core.azclierror import AuthenticationError
         try:
             # Check if an access token is returned.
